@@ -373,7 +373,10 @@ export class SlackChannel implements Channel {
     return baseJid.replace(/^slack:/, '');
   }
 
-  private buildPostPayload(jid: string): { channel: string; thread_ts?: string } {
+  private buildPostPayload(jid: string): {
+    channel: string;
+    thread_ts?: string;
+  } {
     const parsed = parseSlackConversationJid(jid);
     const channel = this.buildChannelId(jid);
     return parsed?.threadTs

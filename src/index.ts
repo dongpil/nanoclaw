@@ -118,8 +118,10 @@ function buildPromptWithRegistrationContext(
   const basePrompt = formatMessages(primaryMessages, TIMEZONE);
   if (chatJid === registrationJid) return basePrompt;
 
-  const { includeRegistrationMessagesForSubConversations, registrationMessageLimit } =
-    resolveRegistrationContextConfig(group);
+  const {
+    includeRegistrationMessagesForSubConversations,
+    registrationMessageLimit,
+  } = resolveRegistrationContextConfig(group);
   if (!includeRegistrationMessagesForSubConversations) return basePrompt;
 
   const registrationMessages = getMessagesSince(
@@ -388,10 +390,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 outputSentToUser = true;
               }
             } catch (err) {
-              logger.warn(
-                { chatJid, err },
-                'Failed to stream partial message',
-              );
+              logger.warn({ chatJid, err }, 'Failed to stream partial message');
               activeStream = null;
             }
           }
@@ -597,7 +596,11 @@ async function startMessageLoop(): Promise<void> {
           // Pull all messages since lastAgentTimestamp so non-trigger
           // context that accumulated between triggers is included.
           const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-          const allPending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+          const allPending = getMessagesSince(
+            chatJid,
+            sinceTimestamp,
+            ASSISTANT_NAME,
+          );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = buildPromptWithRegistrationContext(
