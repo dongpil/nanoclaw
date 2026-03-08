@@ -4,6 +4,7 @@ import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
+import { getRegistrationJid } from './conversation-jid.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
@@ -75,19 +76,28 @@ export function startIpcWatcher(deps: IpcDeps): void {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
               if (data.type === 'message' && data.chatJid && data.text) {
                 // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
+                const registrationJid = getRegistrationJid(data.chatJid);
+                const targetGroup = registeredGroups[registrationJid];
                 if (
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
                   await deps.sendMessage(data.chatJid, data.text);
                   logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
+                    {
+                      chatJid: data.chatJid,
+                      registrationJid,
+                      sourceGroup,
+                    },
                     'IPC message sent',
                   );
                 } else {
                   logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
+                    {
+                      chatJid: data.chatJid,
+                      registrationJid,
+                      sourceGroup,
+                    },
                     'Unauthorized IPC message attempt blocked',
                   );
                 }
@@ -188,11 +198,12 @@ export async function processTaskIpc(
       ) {
         // Resolve the target group from JID
         const targetJid = data.targetJid as string;
-        const targetGroupEntry = registeredGroups[targetJid];
+        const registrationJid = getRegistrationJid(targetJid);
+        const targetGroupEntry = registeredGroups[registrationJid];
 
         if (!targetGroupEntry) {
           logger.warn(
-            { targetJid },
+            { targetJid, registrationJid },
             'Cannot schedule task: target group not registered',
           );
           break;

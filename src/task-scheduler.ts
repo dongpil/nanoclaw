@@ -19,6 +19,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
+import { getSessionKey } from './session-key.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 
 /**
@@ -151,8 +152,11 @@ async function runTask(
 
   // For group context mode, use the group's current session
   const sessions = deps.getSessions();
+  const sessionKey = getSessionKey(task.group_folder, task.chat_jid);
   const sessionId =
-    task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
+    task.context_mode === 'group'
+      ? (sessions[sessionKey] ?? sessions[task.group_folder])
+      : undefined;
 
   // After the task produces a result, close the container promptly.
   // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the

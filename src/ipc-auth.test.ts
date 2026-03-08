@@ -8,6 +8,7 @@ import {
   getTaskById,
   setRegisteredGroup,
 } from './db.js';
+import { getRegistrationJid } from './conversation-jid.js';
 import { processTaskIpc, IpcDeps } from './ipc.js';
 import { RegisteredGroup } from './types.js';
 
@@ -141,6 +142,34 @@ describe('schedule_task authorization', () => {
 
     const allTasks = getAllTasks();
     expect(allTasks.length).toBe(0);
+  });
+
+  it('allows schedule_task for Slack thread when parent channel is registered', async () => {
+    groups['slack:C123'] = {
+      name: 'Slack Channel',
+      folder: 'slack-team',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+    };
+    setRegisteredGroup('slack:C123', groups['slack:C123']);
+
+    await processTaskIpc(
+      {
+        type: 'schedule_task',
+        prompt: 'thread task',
+        schedule_type: 'once',
+        schedule_value: '2025-06-01T00:00:00',
+        targetJid: 'slack:C123::thread:1704067200.000000',
+      },
+      'slack-team',
+      false,
+      deps,
+    );
+
+    const allTasks = getAllTasks();
+    expect(allTasks.length).toBe(1);
+    expect(allTasks[0].group_folder).toBe('slack-team');
+    expect(allTasks[0].chat_jid).toBe('slack:C123::thread:1704067200.000000');
   });
 });
 
@@ -393,7 +422,7 @@ describe('IPC message authorization', () => {
     targetChatJid: string,
     registeredGroups: Record<string, RegisteredGroup>,
   ): boolean {
-    const targetGroup = registeredGroups[targetChatJid];
+    const targetGroup = registeredGroups[getRegistrationJid(targetChatJid)];
     return isMain || (!!targetGroup && targetGroup.folder === sourceGroup);
   }
 
@@ -431,6 +460,25 @@ describe('IPC message authorization', () => {
     // Main is always authorized regardless of target
     expect(
       isMessageAuthorized('whatsapp_main', true, 'unknown@g.us', groups),
+    ).toBe(true);
+  });
+
+  it('non-main group can send to Slack thread of its own registered channel', () => {
+    const slackGroup: RegisteredGroup = {
+      name: 'Slack Channel',
+      folder: 'slack-team',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+    };
+    groups['slack:C123'] = slackGroup;
+
+    expect(
+      isMessageAuthorized(
+        'slack-team',
+        false,
+        'slack:C123::thread:1704067200.000000',
+        groups,
+      ),
     ).toBe(true);
   });
 });

@@ -23,6 +23,7 @@ import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
+import { getRegistrationJid } from './conversation-jid.js';
 import {
   getAllChats,
   getAllRegisteredGroups,
@@ -30,7 +31,6 @@ import {
   getAllTasks,
   getMessagesSince,
   getNewMessages,
-  getRegisteredGroup,
   getRouterState,
   initDatabase,
   setRegisteredGroup,
@@ -43,6 +43,7 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { getSessionKey } from './session-key.js';
 import {
   isSenderAllowed,
   isTriggerAllowed,
@@ -64,6 +65,17 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+function resolveRegisteredGroup(chatJid: string): {
+  registrationJid: string;
+  group?: RegisteredGroup;
+} {
+  const registrationJid = getRegistrationJid(chatJid);
+  return {
+    registrationJid,
+    group: registeredGroups[registrationJid],
+  };
+}
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -141,7 +153,7 @@ export function _setRegisteredGroups(
  * Called by the GroupQueue when it's this group's turn.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
+  const { registrationJid, group } = resolveRegisteredGroup(chatJid);
   if (!group) return true;
 
   const channel = findChannel(channels, chatJid);
@@ -167,7 +179,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     const hasTrigger = missedMessages.some(
       (m) =>
         TRIGGER_PATTERN.test(m.content.trim()) &&
-        (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+        (m.is_from_me ||
+          isTriggerAllowed(registrationJid, m.sender, allowlistCfg)),
     );
     if (!hasTrigger) return true;
   }
@@ -264,7 +277,8 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  const sessionKey = getSessionKey(group.folder, chatJid);
+  const sessionId = sessions[sessionKey];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -295,8 +309,8 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          sessions[sessionKey] = output.newSessionId;
+          setSession(sessionKey, output.newSessionId);
         }
         await onOutput(output);
       }
@@ -319,8 +333,8 @@ async function runAgent(
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      sessions[sessionKey] = output.newSessionId;
+      setSession(sessionKey, output.newSessionId);
     }
 
     if (output.status === 'error') {
@@ -375,7 +389,7 @@ async function startMessageLoop(): Promise<void> {
         }
 
         for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
+          const { registrationJid, group } = resolveRegisteredGroup(chatJid);
           if (!group) continue;
 
           const channel = findChannel(channels, chatJid);
@@ -396,7 +410,7 @@ async function startMessageLoop(): Promise<void> {
               (m) =>
                 TRIGGER_PATTERN.test(m.content.trim()) &&
                 (m.is_from_me ||
-                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+                  isTriggerAllowed(registrationJid, m.sender, allowlistCfg)),
             );
             if (!hasTrigger) continue;
           }
@@ -444,7 +458,15 @@ async function startMessageLoop(): Promise<void> {
  * Handles crash between advancing lastTimestamp and processing messages.
  */
 function recoverPendingMessages(): void {
-  for (const [chatJid, group] of Object.entries(registeredGroups)) {
+  const conversationJids = new Set<string>([
+    ...Object.keys(registeredGroups),
+    ...Object.keys(lastAgentTimestamp),
+  ]);
+
+  for (const chatJid of conversationJids) {
+    const { group } = resolveRegisteredGroup(chatJid);
+    if (!group) continue;
+
     const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
     const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
     if (pending.length > 0) {
@@ -481,16 +503,17 @@ async function main(): Promise<void> {
   // Channel callbacks (shared by all channels)
   const channelOpts = {
     onMessage: (chatJid: string, msg: NewMessage) => {
+      const { registrationJid, group } = resolveRegisteredGroup(chatJid);
       // Sender allowlist drop mode: discard messages from denied senders before storing
-      if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
+      if (!msg.is_from_me && !msg.is_bot_message && group) {
         const cfg = loadSenderAllowlist();
         if (
-          shouldDropMessage(chatJid, cfg) &&
-          !isSenderAllowed(chatJid, msg.sender, cfg)
+          shouldDropMessage(registrationJid, cfg) &&
+          !isSenderAllowed(registrationJid, msg.sender, cfg)
         ) {
           if (cfg.logDenied) {
             logger.debug(
-              { chatJid, sender: msg.sender },
+              { chatJid, registrationJid, sender: msg.sender },
               'sender-allowlist: dropping message (drop mode)',
             );
           }

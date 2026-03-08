@@ -296,6 +296,40 @@ describe('getNewMessages', () => {
     expect(messages).toHaveLength(0);
     expect(newTimestamp).toBe('');
   });
+
+  it('includes Slack thread conversations when base channel is registered', () => {
+    storeChatMetadata('slack:C123', '2024-01-01T00:00:00.000Z');
+    storeChatMetadata(
+      'slack:C123::thread:1704067200.000000',
+      '2024-01-01T00:00:00.000Z',
+    );
+    store({
+      id: 'a5',
+      chat_jid: 'slack:C123',
+      sender: 'U1',
+      sender_name: 'User',
+      content: 'channel message',
+      timestamp: '2024-01-01T00:00:05.000Z',
+    });
+    store({
+      id: 'a6',
+      chat_jid: 'slack:C123::thread:1704067200.000000',
+      sender: 'U1',
+      sender_name: 'User',
+      content: 'thread message',
+      timestamp: '2024-01-01T00:00:06.000Z',
+    });
+
+    const { messages } = getNewMessages(
+      ['slack:C123'],
+      '2024-01-01T00:00:00.000Z',
+      'Andy',
+    );
+    expect(messages.map((m) => m.chat_jid)).toEqual([
+      'slack:C123',
+      'slack:C123::thread:1704067200.000000',
+    ]);
+  });
 });
 
 // --- storeChatMetadata ---

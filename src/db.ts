@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
+import { getSlackThreadLikePattern } from './conversation-jid.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -310,7 +311,19 @@ export function getNewMessages(
 ): { messages: NewMessage[]; newTimestamp: string } {
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
-  const placeholders = jids.map(() => '?').join(',');
+  const whereClauses: string[] = [];
+  const jidParams: string[] = [];
+  for (const jid of jids) {
+    const threadPattern = getSlackThreadLikePattern(jid);
+    if (threadPattern) {
+      whereClauses.push('(chat_jid = ? OR chat_jid LIKE ?)');
+      jidParams.push(jid, threadPattern);
+      continue;
+    }
+    whereClauses.push('chat_jid = ?');
+    jidParams.push(jid);
+  }
+
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   // Subquery takes the N most recent, outer query re-sorts chronologically.
@@ -318,7 +331,7 @@ export function getNewMessages(
     SELECT * FROM (
       SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
       FROM messages
-      WHERE timestamp > ? AND chat_jid IN (${placeholders})
+      WHERE timestamp > ? AND (${whereClauses.join(' OR ')})
         AND is_bot_message = 0 AND content NOT LIKE ?
         AND content != '' AND content IS NOT NULL
       ORDER BY timestamp DESC
@@ -328,7 +341,7 @@ export function getNewMessages(
 
   const rows = db
     .prepare(sql)
-    .all(lastTimestamp, ...jids, `${botPrefix}:%`, limit) as NewMessage[];
+    .all(lastTimestamp, ...jidParams, `${botPrefix}:%`, limit) as NewMessage[];
 
   let newTimestamp = lastTimestamp;
   for (const row of rows) {
