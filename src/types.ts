@@ -30,6 +30,13 @@ export interface AllowedRoot {
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
+  conversationContext?: {
+    // For sub-conversations (e.g. Slack threads), include parent channel/group
+    // messages as additional context in the agent prompt.
+    includeRegistrationMessagesForSubConversations?: boolean;
+    // Max number of parent-channel messages to include per turn.
+    registrationMessageLimit?: number;
+  };
 }
 
 export interface RegisteredGroup {
@@ -83,6 +90,18 @@ export interface Channel {
   name: string;
   connect(): Promise<void>;
   sendMessage(jid: string, text: string): Promise<void>;
+  // Optional: streaming lifecycle support (e.g., Slack postMessage + chat.update)
+  startStreamingMessage?(jid: string, text: string): Promise<string>;
+  updateStreamingMessage?(
+    jid: string,
+    streamId: string,
+    text: string,
+  ): Promise<void>;
+  finalizeStreamingMessage?(
+    jid: string,
+    streamId: string,
+    text: string,
+  ): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;

@@ -16,7 +16,11 @@ import {
   TIMEZONE,
 } from './config.js';
 import { readEnvFile } from './env.js';
-import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
+import {
+  resolveConversationIpcInputPath,
+  resolveGroupFolderPath,
+  resolveGroupIpcPath,
+} from './group-folder.js';
 import { logger } from './logger.js';
 import {
   CONTAINER_RUNTIME_BIN,
@@ -44,6 +48,7 @@ export interface ContainerInput {
 export interface ContainerOutput {
   status: 'success' | 'error';
   result: string | null;
+  phase?: 'status' | 'partial' | 'final';
   newSessionId?: string;
   error?: string;
 }
@@ -57,6 +62,7 @@ interface VolumeMount {
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  chatJid: string,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -173,6 +179,15 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Per-conversation input namespace (avoids cross-thread/session mixing).
+  const convoInputDir = resolveConversationIpcInputPath(group.folder, chatJid);
+  fs.mkdirSync(convoInputDir, { recursive: true });
+  mounts.push({
+    hostPath: convoInputDir,
+    containerPath: '/workspace/ipc/input',
+    readonly: false,
+  });
+
   // Copy agent-runner source into a per-group writable location so agents
   // can customize it (add tools, change behavior) without affecting other
   // groups. Recompiled on container startup via entrypoint.sh.
@@ -188,8 +203,22 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  const sourceIndex = path.join(agentRunnerSrc, 'index.ts');
+  const targetIndex = path.join(groupAgentRunnerDir, 'index.ts');
+  const shouldSyncAgentRunner =
+    fs.existsSync(agentRunnerSrc) &&
+    fs.existsSync(sourceIndex) &&
+    (!fs.existsSync(targetIndex) ||
+      fs.statSync(sourceIndex).mtimeMs > fs.statSync(targetIndex).mtimeMs);
+  if (shouldSyncAgentRunner) {
+    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, {
+      recursive: true,
+      force: true,
+    });
+    logger.info(
+      { group: group.name, groupAgentRunnerDir },
+      'Synced latest agent-runner source into group session',
+    );
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
@@ -266,7 +295,7 @@ export async function runContainerAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  const mounts = buildVolumeMounts(group, input.isMain, input.chatJid);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
@@ -362,7 +391,16 @@ export async function runContainerAgent(
             resetTimeout();
             // Call onOutput for all markers (including null results)
             // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
+            outputChain = outputChain.then(async () => {
+              try {
+                await onOutput(parsed);
+              } catch (err) {
+                logger.warn(
+                  { group: group.name, err },
+                  'onOutput callback failed; continuing stream processing',
+                );
+              }
+            });
           } catch (err) {
             logger.warn(
               { group: group.name, error: err },
@@ -455,13 +493,20 @@ export async function runContainerAgent(
             { group: group.name, containerName, duration, code },
             'Container timed out after output (idle cleanup)',
           );
-          outputChain.then(() => {
-            resolve({
-              status: 'success',
-              result: null,
-              newSessionId,
+          outputChain
+            .catch((err) => {
+              logger.warn(
+                { group: group.name, err },
+                'Streaming output chain failed during timeout handling',
+              );
+            })
+            .then(() => {
+              resolve({
+                status: 'success',
+                result: null,
+                newSessionId,
+              });
             });
-          });
           return;
         }
 
@@ -559,17 +604,24 @@ export async function runContainerAgent(
 
       // Streaming mode: wait for output chain to settle, return completion marker
       if (onOutput) {
-        outputChain.then(() => {
-          logger.info(
-            { group: group.name, duration, newSessionId },
-            'Container completed (streaming mode)',
-          );
-          resolve({
-            status: 'success',
-            result: null,
-            newSessionId,
+        outputChain
+          .catch((err) => {
+            logger.warn(
+              { group: group.name, err },
+              'Streaming output chain failed before container close',
+            );
+          })
+          .then(() => {
+            logger.info(
+              { group: group.name, duration, newSessionId },
+              'Container completed (streaming mode)',
+            );
+            resolve({
+              status: 'success',
+              result: null,
+              newSessionId,
+            });
           });
-        });
         return;
       }
 

@@ -42,3 +42,29 @@ export function resolveGroupIpcPath(folder: string): string {
   ensureWithinBase(ipcBaseDir, ipcPath);
   return ipcPath;
 }
+
+/**
+ * Stable, filesystem-safe key for per-conversation IPC namespaces.
+ * Uses base64url to preserve uniqueness while avoiding path separators.
+ */
+export function getConversationIpcKey(chatJid: string): string {
+  return Buffer.from(chatJid, 'utf8').toString('base64url');
+}
+
+/**
+ * Resolve per-conversation IPC input directory:
+ *   data/ipc/<groupFolder>/input/<conversationKey>
+ */
+export function resolveConversationIpcInputPath(
+  folder: string,
+  chatJid: string,
+): string {
+  const groupIpcPath = resolveGroupIpcPath(folder);
+  const inputPath = path.resolve(
+    groupIpcPath,
+    'input',
+    getConversationIpcKey(chatJid),
+  );
+  ensureWithinBase(groupIpcPath, inputPath);
+  return inputPath;
+}

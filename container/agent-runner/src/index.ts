@@ -33,6 +33,7 @@ interface ContainerInput {
 interface ContainerOutput {
   status: 'success' | 'error';
   result: string | null;
+  phase?: 'status' | 'partial' | 'final';
   newSessionId?: string;
   error?: string;
 }
@@ -116,6 +117,166 @@ function writeOutput(output: ContainerOutput): void {
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
+}
+
+function extractTextParts(content: unknown): string {
+  if (!content) return '';
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+
+  let text = '';
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+    const block = part as Record<string, unknown>;
+    if (typeof block.text === 'string') {
+      text += block.text;
+      continue;
+    }
+    if (typeof block.content === 'string') {
+      text += block.content;
+      continue;
+    }
+  }
+  return text;
+}
+
+function extractAssistantSnapshotText(message: unknown): string | null {
+  if (!message || typeof message !== 'object') return null;
+  const msg = message as Record<string, unknown>;
+  if (msg.type !== 'assistant') return null;
+
+  if (typeof msg.text === 'string' && msg.text) return msg.text;
+
+  const payload = msg.message;
+  if (payload && typeof payload === 'object') {
+    const p = payload as Record<string, unknown>;
+    if (typeof p.content === 'string' && p.content) return p.content;
+    const fromPayload = extractTextParts(p.content);
+    if (fromPayload) return fromPayload;
+  }
+
+  const fromMessage = extractTextParts(msg.content);
+  return fromMessage || null;
+}
+
+function extractDeltaText(value: unknown): string | null {
+  if (!value) return null;
+  if (typeof value === 'string') return value;
+  if (typeof value !== 'object') return null;
+
+  const obj = value as Record<string, unknown>;
+  if (typeof obj.text === 'string' && obj.text) return obj.text;
+
+  const delta = obj.delta;
+  if (delta && typeof delta === 'object') {
+    const d = delta as Record<string, unknown>;
+    if (typeof d.text === 'string' && d.text) return d.text;
+  }
+
+  const contentBlock = obj.content_block;
+  if (contentBlock && typeof contentBlock === 'object') {
+    const cb = contentBlock as Record<string, unknown>;
+    if (typeof cb.text === 'string' && cb.text) return cb.text;
+  }
+
+  return null;
+}
+
+function extractStreamEventDeltaText(message: unknown): string | null {
+  if (!message || typeof message !== 'object') return null;
+  const msg = message as Record<string, unknown>;
+  if (msg.type !== 'stream_event') return null;
+
+  const candidates = [msg.delta, msg.event, msg.content_block_delta];
+  for (const candidate of candidates) {
+    const text = extractDeltaText(candidate);
+    if (text) return text;
+  }
+  return null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object') return null;
+  return value as Record<string, unknown>;
+}
+
+function inferProcessingStatus(
+  message: unknown,
+  currentToolName?: string,
+): { statusText?: string; toolName?: string } {
+  const msg = asRecord(message);
+  if (!msg) return {};
+
+  const messageType = typeof msg.type === 'string' ? msg.type : '';
+  if (messageType === 'system') {
+    const subtype = typeof msg.subtype === 'string' ? msg.subtype : '';
+    if (subtype === 'init') {
+      return { statusText: '세션 초기화 중...' };
+    }
+    if (subtype === 'task_notification') {
+      const summary = typeof msg.summary === 'string' ? msg.summary.trim() : '';
+      return summary
+        ? { statusText: `하위 작업 진행 중: ${summary}` }
+        : { statusText: '하위 작업 진행 중...' };
+    }
+    return {};
+  }
+
+  if (messageType === 'rate_limit_event') {
+    return { statusText: '모델 응답 대기 중...' };
+  }
+
+  if (messageType !== 'stream_event') return {};
+
+  const event = asRecord(msg.event);
+  const delta = asRecord(event?.delta ?? msg.delta ?? msg.content_block_delta);
+  const contentBlock = asRecord(event?.content_block ?? msg.content_block);
+  const eventType =
+    (event && typeof event.type === 'string' ? event.type : undefined) ||
+    (typeof msg.subtype === 'string' ? msg.subtype : undefined);
+  const blockType =
+    typeof contentBlock?.type === 'string' ? contentBlock.type : undefined;
+  const toolNameFromBlock =
+    typeof contentBlock?.name === 'string' ? contentBlock.name : undefined;
+  const deltaType = typeof delta?.type === 'string' ? delta.type : undefined;
+
+  if (blockType === 'tool_use' && toolNameFromBlock) {
+    return {
+      statusText: `도구 실행 중: ${toolNameFromBlock}`,
+      toolName: toolNameFromBlock,
+    };
+  }
+
+  if (deltaType === 'input_json_delta') {
+    const toolName =
+      currentToolName ||
+      (typeof delta?.name === 'string' ? (delta.name as string) : undefined);
+    return {
+      statusText: toolName
+        ? `도구 입력 구성 중: ${toolName}`
+        : '도구 입력 구성 중...',
+    };
+  }
+
+  if (eventType === 'message_start') {
+    return { statusText: '요청 분석 중...' };
+  }
+  if (eventType === 'message_delta') {
+    return { statusText: '중간 결과 정리 중...' };
+  }
+  if (eventType === 'message_stop') {
+    return { statusText: '최종 답변 정리 중...' };
+  }
+
+  if (eventType && eventType.includes('tool')) {
+    return {
+      statusText: currentToolName
+        ? `도구 처리 중: ${currentToolName}`
+        : '도구 처리 중...',
+    };
+  }
+
+  return {};
 }
 
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
@@ -390,6 +551,51 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  let partialText = '';
+  let lastEmittedPartial = '';
+  let lastPartialEmitAt = 0;
+  let lastStatusText = '';
+  let lastStatusEmitAt = 0;
+  let currentToolName: string | undefined;
+  const PARTIAL_EMIT_INTERVAL_MS = 1200;
+  const STATUS_EMIT_INTERVAL_MS = 800;
+  const MAX_PARTIAL_TEXT = 3000;
+
+  const emitStatus = (statusText: string, force = false) => {
+    const normalized = statusText.trim();
+    if (!normalized) return;
+    if (!force && normalized === lastStatusText) return;
+    const now = Date.now();
+    if (!force && now - lastStatusEmitAt < STATUS_EMIT_INTERVAL_MS) return;
+    writeOutput({
+      status: 'success',
+      result: normalized,
+      phase: 'status',
+      newSessionId,
+    });
+    lastStatusText = normalized;
+    lastStatusEmitAt = now;
+  };
+
+  const emitPartial = (force = false) => {
+    const trimmed = partialText.trim();
+    if (!trimmed) return;
+    if (partialText === lastEmittedPartial) return;
+    const now = Date.now();
+    if (!force && now - lastPartialEmitAt < PARTIAL_EMIT_INTERVAL_MS) return;
+    const partialForChannel =
+      partialText.length > MAX_PARTIAL_TEXT
+        ? `${partialText.slice(0, MAX_PARTIAL_TEXT)}\n\n…(streaming)`
+        : partialText;
+    writeOutput({
+      status: 'success',
+      result: partialForChannel,
+      phase: 'partial',
+      newSessionId,
+    });
+    lastEmittedPartial = partialText;
+    lastPartialEmitAt = now;
+  };
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -453,6 +659,7 @@ async function runQuery(
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
         PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
       },
+      includePartialMessages: true,
     }
   })) {
     messageCount++;
@@ -466,6 +673,7 @@ async function runQuery(
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
+      emitStatus('세션 초기화 완료, 응답 준비 중...', true);
     }
 
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
@@ -473,19 +681,42 @@ async function runQuery(
       log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
     }
 
+    const inferredStatus = inferProcessingStatus(message, currentToolName);
+    if (inferredStatus.toolName) currentToolName = inferredStatus.toolName;
+    if (inferredStatus.statusText) emitStatus(inferredStatus.statusText);
+
+    const deltaText = extractStreamEventDeltaText(message);
+    if (deltaText) {
+      partialText += deltaText;
+      emitPartial();
+    }
+
+    const assistantSnapshot = extractAssistantSnapshotText(message);
+    if (assistantSnapshot) {
+      partialText = assistantSnapshot;
+      emitPartial();
+    }
+
     if (message.type === 'result') {
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      const finalText = textResult || (partialText.trim() ? partialText : null);
       writeOutput({
         status: 'success',
-        result: textResult || null,
+        result: finalText,
+        phase: 'final',
         newSessionId
       });
+      currentToolName = undefined;
+      partialText = '';
+      lastEmittedPartial = '';
+      lastPartialEmitAt = 0;
     }
   }
 
   ipcPolling = false;
+  emitPartial(true);
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }

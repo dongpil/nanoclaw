@@ -14,14 +14,20 @@ export function formatMessages(
   messages: NewMessage[],
   timezone: string,
 ): string {
+  const header = `<context timezone="${escapeXml(timezone)}" />\n`;
+  return `${header}${formatMessagesBlock(messages, timezone)}`;
+}
+
+export function formatMessagesBlock(
+  messages: NewMessage[],
+  timezone: string,
+  tag: string = 'messages',
+): string {
   const lines = messages.map((m) => {
     const displayTime = formatLocalTime(m.timestamp, timezone);
     return `<message sender="${escapeXml(m.sender_name)}" time="${escapeXml(displayTime)}">${escapeXml(m.content)}</message>`;
   });
-
-  const header = `<context timezone="${escapeXml(timezone)}" />\n`;
-
-  return `${header}<messages>\n${lines.join('\n')}\n</messages>`;
+  return `<${tag}>\n${lines.join('\n')}\n</${tag}>`;
 }
 
 export function stripInternalTags(text: string): string {

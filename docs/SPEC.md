@@ -372,6 +372,10 @@ registerGroup("1234567890@g.us", {
       },
     ],
     timeout: 600000,
+    conversationContext: {
+      includeRegistrationMessagesForSubConversations: true,
+      registrationMessageLimit: 30,
+    },
   },
 });
 ```
@@ -379,6 +383,8 @@ registerGroup("1234567890@g.us", {
 Folder names follow the convention `{channel}_{group-name}` (e.g., `whatsapp_family-chat`, `telegram_dev-team`). The main group has `isMain: true` set during registration.
 
 Additional mounts appear at `/workspace/extra/{containerPath}` inside the container.
+
+When `conversationContext.includeRegistrationMessagesForSubConversations` is enabled, sub-conversations (for example Slack threads) include recent parent channel messages as supplemental prompt context. The supplemental message count is capped by `registrationMessageLimit` (default `30`, max `200`).
 
 **Mount syntax note:** Read-write mounts use `-v host:container`, but readonly mounts require `--mount "type=bind,source=...,target=...,readonly"` (the `:ro` suffix may not work on all runtimes).
 

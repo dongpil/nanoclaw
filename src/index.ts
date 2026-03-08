@@ -42,7 +42,12 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import {
+  findChannel,
+  formatMessages,
+  formatMessagesBlock,
+  formatOutbound,
+} from './router.js';
 import { getSessionKey } from './session-key.js';
 import {
   isSenderAllowed,
@@ -65,6 +70,8 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+const DEFAULT_REGISTRATION_CONTEXT_LIMIT = 30;
+const MAX_REGISTRATION_CONTEXT_LIMIT = 200;
 
 function resolveRegisteredGroup(chatJid: string): {
   registrationJid: string;
@@ -75,6 +82,60 @@ function resolveRegisteredGroup(chatJid: string): {
     registrationJid,
     group: registeredGroups[registrationJid],
   };
+}
+
+function resolveRegistrationContextConfig(group: RegisteredGroup): {
+  includeRegistrationMessagesForSubConversations: boolean;
+  registrationMessageLimit: number;
+} {
+  const cfg = group.containerConfig?.conversationContext;
+  const includeRegistrationMessagesForSubConversations =
+    cfg?.includeRegistrationMessagesForSubConversations === true;
+
+  const rawLimit = cfg?.registrationMessageLimit;
+  const parsedLimit =
+    typeof rawLimit === 'number' && Number.isFinite(rawLimit)
+      ? Math.floor(rawLimit)
+      : DEFAULT_REGISTRATION_CONTEXT_LIMIT;
+  const registrationMessageLimit = Math.max(
+    1,
+    Math.min(MAX_REGISTRATION_CONTEXT_LIMIT, parsedLimit),
+  );
+
+  return {
+    includeRegistrationMessagesForSubConversations,
+    registrationMessageLimit,
+  };
+}
+
+function buildPromptWithRegistrationContext(
+  chatJid: string,
+  registrationJid: string,
+  group: RegisteredGroup,
+  primaryMessages: NewMessage[],
+  sinceTimestamp: string,
+): string {
+  const basePrompt = formatMessages(primaryMessages, TIMEZONE);
+  if (chatJid === registrationJid) return basePrompt;
+
+  const { includeRegistrationMessagesForSubConversations, registrationMessageLimit } =
+    resolveRegistrationContextConfig(group);
+  if (!includeRegistrationMessagesForSubConversations) return basePrompt;
+
+  const registrationMessages = getMessagesSince(
+    registrationJid,
+    sinceTimestamp,
+    ASSISTANT_NAME,
+    registrationMessageLimit,
+  );
+  if (registrationMessages.length === 0) return basePrompt;
+
+  return `${basePrompt}
+
+<registration_context>
+Parent channel/group messages for additional context. Use only if relevant.
+${formatMessagesBlock(registrationMessages, TIMEZONE, 'messages')}
+</registration_context>`;
 }
 
 function loadState(): void {
@@ -185,7 +246,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  const prompt = buildPromptWithRegistrationContext(
+    chatJid,
+    registrationJid,
+    group,
+    missedMessages,
+    sinceTimestamp,
+  );
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -216,6 +283,51 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  let activeStream: { streamId: string; lastText: string } | null = null;
+  const supportsStreaming =
+    typeof channel.startStreamingMessage === 'function' &&
+    typeof channel.updateStreamingMessage === 'function' &&
+    typeof channel.finalizeStreamingMessage === 'function';
+
+  const finalizeActiveStream = async (finalText?: string): Promise<void> => {
+    if (!activeStream || !supportsStreaming) return;
+    const textToFinalize =
+      (finalText || activeStream.lastText).trim() || '완료되었습니다.';
+    try {
+      await channel.finalizeStreamingMessage!(
+        chatJid,
+        activeStream.streamId,
+        textToFinalize,
+      );
+      outputSentToUser = true;
+    } catch (err) {
+      logger.warn(
+        { chatJid, err },
+        'Failed to finalize streaming message, falling back to sendMessage',
+      );
+      await channel.sendMessage(chatJid, textToFinalize);
+      outputSentToUser = true;
+    } finally {
+      activeStream = null;
+    }
+  };
+
+  if (supportsStreaming) {
+    try {
+      const streamId = await channel.startStreamingMessage!(
+        chatJid,
+        '요청 접수됨. 처리 시작 중...',
+      );
+      activeStream = { streamId, lastText: '' };
+      outputSentToUser = true;
+    } catch (err) {
+      logger.warn(
+        { chatJid, err },
+        'Failed to start streaming placeholder message',
+      );
+      activeStream = null;
+    }
+  }
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -224,22 +336,89 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         typeof result.result === 'string'
           ? result.result
           : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+      const text = formatOutbound(raw);
+      const phase = result.phase ?? 'final';
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
+
+      if (phase === 'status') {
+        if (supportsStreaming) {
+          const statusText = text;
+          try {
+            if (!activeStream) {
+              const streamId = await channel.startStreamingMessage!(
+                chatJid,
+                statusText,
+              );
+              activeStream = { streamId, lastText: '' };
+              outputSentToUser = true;
+            } else if (!activeStream.lastText) {
+              await channel.updateStreamingMessage!(
+                chatJid,
+                activeStream.streamId,
+                statusText,
+              );
+              outputSentToUser = true;
+            }
+          } catch (err) {
+            logger.debug({ chatJid, err }, 'Failed to stream status update');
+          }
+        }
+        resetIdleTimer();
+        return;
+      }
+
       if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+        if (phase === 'partial') {
+          if (supportsStreaming) {
+            try {
+              if (!activeStream) {
+                const streamId = await channel.startStreamingMessage!(
+                  chatJid,
+                  text,
+                );
+                activeStream = { streamId, lastText: text };
+                outputSentToUser = true;
+              } else if (text !== activeStream.lastText) {
+                await channel.updateStreamingMessage!(
+                  chatJid,
+                  activeStream.streamId,
+                  text,
+                );
+                activeStream.lastText = text;
+                outputSentToUser = true;
+              }
+            } catch (err) {
+              logger.warn(
+                { chatJid, err },
+                'Failed to stream partial message',
+              );
+              activeStream = null;
+            }
+          }
+        } else {
+          if (activeStream && supportsStreaming) {
+            await finalizeActiveStream(text);
+          } else {
+            await channel.sendMessage(chatJid, text);
+            outputSentToUser = true;
+          }
+        }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
     }
 
     if (result.status === 'success') {
+      if (!result.result && activeStream && supportsStreaming) {
+        await finalizeActiveStream();
+      }
       queue.notifyIdle(chatJid);
     }
 
     if (result.status === 'error') {
+      if (activeStream && supportsStreaming) {
+        await finalizeActiveStream('오류가 발생했습니다.');
+      }
       hadError = true;
     }
   });
@@ -417,14 +596,17 @@ async function startMessageLoop(): Promise<void> {
 
           // Pull all messages since lastAgentTimestamp so non-trigger
           // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
-          );
+          const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+          const allPending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend, TIMEZONE);
+          const formatted = buildPromptWithRegistrationContext(
+            chatJid,
+            registrationJid,
+            group,
+            messagesToSend,
+            sinceTimestamp,
+          );
 
           if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(

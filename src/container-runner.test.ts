@@ -206,4 +206,77 @@ describe('container-runner timeout behavior', () => {
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
   });
+
+  it('forwards partial and final output markers in order', async () => {
+    const onOutput = vi.fn(async () => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+    );
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Hel',
+      phase: 'partial',
+      newSessionId: 'session-789',
+    });
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Hello',
+      phase: 'final',
+      newSessionId: 'session-789',
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    await resultPromise;
+    expect(onOutput).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ phase: 'partial', result: 'Hel' }),
+    );
+    expect(onOutput).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ phase: 'final', result: 'Hello' }),
+    );
+  });
+
+  it('continues streaming even if onOutput callback throws', async () => {
+    const onOutput = vi.fn(async (output: ContainerOutput) => {
+      if (output.phase === 'partial') {
+        throw new Error('temporary callback failure');
+      }
+    });
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+    );
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Hel',
+      phase: 'partial',
+      newSessionId: 'session-999',
+    });
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Hello',
+      phase: 'final',
+      newSessionId: 'session-999',
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('success');
+    expect(result.newSessionId).toBe('session-999');
+    expect(onOutput).toHaveBeenCalledTimes(2);
+  });
 });

@@ -43,7 +43,12 @@ vi.mock('@slack/bolt', () => ({
         test: vi.fn().mockResolvedValue({ user_id: 'U_BOT_123' }),
       },
       chat: {
-        postMessage: vi.fn().mockResolvedValue(undefined),
+        postMessage: vi.fn().mockResolvedValue({ ts: '1704067200.000001' }),
+        update: vi.fn().mockResolvedValue(undefined),
+      },
+      reactions: {
+        add: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue(undefined),
       },
       conversations: {
         list: vi.fn().mockResolvedValue({
@@ -529,6 +534,46 @@ describe('SlackChannel', () => {
         }),
       );
     });
+
+    it('starts a thread-scoped conversation with spaced html sentinel', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        ts: '1704067212.000000',
+        text: '@Jonesy vLLM topic &gt; &gt;',
+      });
+      await triggerMessageEvent(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789::thread:1704067212.000000',
+        expect.objectContaining({
+          chat_jid: 'slack:C0123456789::thread:1704067212.000000',
+          content: '@Jonesy vLLM topic',
+        }),
+      );
+    });
+
+    it('starts a thread-scoped conversation with zero-width chars after >>', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        ts: '1704067213.000000',
+        text: '@Jonesy vLLM topic >>\u200b',
+      });
+      await triggerMessageEvent(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789::thread:1704067213.000000',
+        expect.objectContaining({
+          chat_jid: 'slack:C0123456789::thread:1704067213.000000',
+          content: '@Jonesy vLLM topic',
+        }),
+      );
+    });
   });
 
   // --- @mention translation ---
@@ -754,6 +799,64 @@ describe('SlackChannel', () => {
       expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
         channel: 'C0123456789',
         text: 'Second queued',
+      });
+    });
+  });
+
+  // --- streaming lifecycle ---
+
+  describe('streaming lifecycle', () => {
+    it('starts streaming message and returns message ts', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const streamId = await channel.startStreamingMessage!(
+        'slack:C0123456789::thread:1704067200.000000',
+        'Partial text',
+      );
+
+      expect(streamId).toBe('1704067200.000001');
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        thread_ts: '1704067200.000000',
+        text: 'Partial text',
+      });
+    });
+
+    it('updates streaming message with chat.update', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.updateStreamingMessage!(
+        'slack:C0123456789::thread:1704067200.000000',
+        '1704067200.000123',
+        'Updated text',
+      );
+
+      expect(currentApp().client.chat.update).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        ts: '1704067200.000123',
+        text: 'Updated text',
+      });
+    });
+
+    it('finalizes streaming message via chat.update', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.finalizeStreamingMessage!(
+        'slack:C0123456789',
+        '1704067200.000456',
+        'Final text',
+      );
+
+      expect(currentApp().client.chat.update).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        ts: '1704067200.000456',
+        text: 'Final text',
       });
     });
   });

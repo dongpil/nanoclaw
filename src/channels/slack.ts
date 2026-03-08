@@ -20,7 +20,8 @@ import {
 // Slack's chat.postMessage API limits text to ~4000 characters per call.
 // Messages exceeding this are split into sequential chunks.
 const MAX_MESSAGE_LENGTH = 4000;
-const THREAD_SENTINEL_RE = /(?:>>|&gt;&gt;)\s*$/i;
+const THREAD_SENTINEL_RE =
+  /(?:>>|>\s*>|&gt;&gt;|&gt;\s*&gt;|＞＞|＞\s*＞|»»|»\s*»)\s*$/i;
 
 // The message subtypes we process. Bolt delivers all subtypes via app.event('message');
 // we filter to regular messages (GenericMessageEvent, subtype undefined) and bot messages
@@ -90,11 +91,14 @@ export class SlackChannel implements Channel {
 
       const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
+      const normalizedText = (msg.text ?? '')
+        .replace(/[\u200B-\u200D\uFEFF]/g, '')
+        .trimEnd();
       const isThreadReply = !!msg.thread_ts && msg.thread_ts !== msg.ts;
       const startsThreadSession =
         !isBotMessage &&
         !isThreadReply &&
-        THREAD_SENTINEL_RE.test((msg.text ?? '').trimEnd());
+        THREAD_SENTINEL_RE.test(normalizedText);
       const conversationJid = buildSlackConversationJid(
         msg.channel,
         isThreadReply
@@ -146,7 +150,13 @@ export class SlackChannel implements Channel {
         }
       }
       if (startsThreadSession) {
-        content = content.replace(/\s*(?:>>|&gt;&gt;)\s*$/i, '').trimEnd();
+        content = content
+          .replace(/[\u200B-\u200D\uFEFF]/g, '')
+          .replace(
+            /\s*(?:>>|>\s*>|&gt;&gt;|&gt;\s*&gt;|＞＞|＞\s*＞|»»|»\s*»)\s*$/i,
+            '',
+          )
+          .trimEnd();
         if (!content) return;
       }
 
@@ -187,13 +197,7 @@ export class SlackChannel implements Channel {
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
-    const parsed = parseSlackConversationJid(jid);
-    const baseJid = parsed?.baseJid ?? jid;
-    const threadTs = parsed?.threadTs;
-    const channelId = baseJid.replace(/^slack:/, '');
-    const payloadBase = threadTs
-      ? { channel: channelId, thread_ts: threadTs }
-      : { channel: channelId };
+    const payloadBase = this.buildPostPayload(jid);
 
     if (!this.connected) {
       this.outgoingQueue.push({ jid, text });
@@ -227,6 +231,45 @@ export class SlackChannel implements Channel {
         'Failed to send Slack message, queued',
       );
     }
+  }
+
+  async startStreamingMessage(jid: string, text: string): Promise<string> {
+    if (!this.connected) {
+      throw new Error('Slack channel is not connected');
+    }
+
+    const response = await this.app.client.chat.postMessage({
+      ...this.buildPostPayload(jid),
+      text,
+    });
+    const streamId = response.ts;
+    if (!streamId) {
+      throw new Error('Slack did not return message ts for streaming message');
+    }
+    return streamId;
+  }
+
+  async updateStreamingMessage(
+    jid: string,
+    streamId: string,
+    text: string,
+  ): Promise<void> {
+    if (!this.connected) {
+      throw new Error('Slack channel is not connected');
+    }
+    await this.app.client.chat.update({
+      channel: this.buildChannelId(jid),
+      ts: streamId,
+      text,
+    });
+  }
+
+  async finalizeStreamingMessage(
+    jid: string,
+    streamId: string,
+    text: string,
+  ): Promise<void> {
+    await this.updateStreamingMessage(jid, streamId, text);
   }
 
   isConnected(): boolean {
@@ -310,14 +353,8 @@ export class SlackChannel implements Channel {
       );
       while (this.outgoingQueue.length > 0) {
         const item = this.outgoingQueue.shift()!;
-        const parsed = parseSlackConversationJid(item.jid);
-        const baseJid = parsed?.baseJid ?? item.jid;
-        const channelId = baseJid.replace(/^slack:/, '');
-        const payloadBase = parsed?.threadTs
-          ? { channel: channelId, thread_ts: parsed.threadTs }
-          : { channel: channelId };
         await this.app.client.chat.postMessage({
-          ...payloadBase,
+          ...this.buildPostPayload(item.jid),
           text: item.text,
         });
         logger.info(
@@ -328,6 +365,20 @@ export class SlackChannel implements Channel {
     } finally {
       this.flushing = false;
     }
+  }
+
+  private buildChannelId(jid: string): string {
+    const parsed = parseSlackConversationJid(jid);
+    const baseJid = parsed?.baseJid ?? jid;
+    return baseJid.replace(/^slack:/, '');
+  }
+
+  private buildPostPayload(jid: string): { channel: string; thread_ts?: string } {
+    const parsed = parseSlackConversationJid(jid);
+    const channel = this.buildChannelId(jid);
+    return parsed?.threadTs
+      ? { channel, thread_ts: parsed.threadTs }
+      : { channel };
   }
 }
 
